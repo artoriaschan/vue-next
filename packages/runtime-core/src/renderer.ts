@@ -36,7 +36,8 @@ import {
   NOOP,
   hasOwn,
   invokeArrayFns,
-  isArray
+  isArray,
+  getGlobalThis
 } from '@vue/shared'
 import {
   queueJob,
@@ -56,7 +57,11 @@ import {
   queueEffectWithSuspense,
   SuspenseImpl
 } from './components/Suspense'
-import { TeleportImpl, TeleportVNode } from './components/Teleport'
+import {
+  isTeleportDisabled,
+  TeleportImpl,
+  TeleportVNode
+} from './components/Teleport'
 import { isKeepAlive, KeepAliveContext } from './components/KeepAlive'
 import { registerHMR, unregisterHMR, isHmrUpdating } from './hmr'
 import {
@@ -68,8 +73,14 @@ import { createHydrationFunctions, RootHydrateFunction } from './hydration'
 import { invokeDirectiveHook } from './directives'
 import { startMeasure, endMeasure } from './profiling'
 import { ComponentPublicInstance } from './componentPublicInstance'
-import { devtoolsComponentRemoved, devtoolsComponentUpdated } from './devtools'
+import {
+  devtoolsComponentAdded,
+  devtoolsComponentRemoved,
+  devtoolsComponentUpdated,
+  setDevtoolsHook
+} from './devtools'
 import { initFeatureFlags } from './featureFlags'
+import { isAsyncWrapper } from './apiAsyncComponent'
 
 export interface Renderer<HostElement = RendererElement> {
   render: RootRenderFunction<HostElement>
@@ -82,7 +93,8 @@ export interface HydrationRenderer extends Renderer<Element> {
 
 export type RootRenderFunction<HostElement = RendererElement> = (
   vnode: VNode | null,
-  container: HostElement
+  container: HostElement,
+  isSVG?: boolean
 ) => void
 
 export interface RendererOptions<
@@ -285,7 +297,6 @@ export const queuePostRenderEffect = __FEATURE_SUSPENSE__
 export const setRef = (
   rawRef: VNodeNormalizedRef,
   oldRawRef: VNodeNormalizedRef | null,
-  parentComponent: ComponentInternalInstance,
   parentSuspense: SuspenseBoundary | null,
   vnode: VNode | null
 ) => {
@@ -294,7 +305,6 @@ export const setRef = (
       setRef(
         r,
         oldRawRef && (isArray(oldRawRef) ? oldRawRef[i] : oldRawRef),
-        parentComponent,
         parentSuspense,
         vnode
       )
@@ -302,15 +312,18 @@ export const setRef = (
     return
   }
 
-  let value: ComponentPublicInstance | RendererNode | null
+  let value: ComponentPublicInstance | RendererNode | Record<string, any> | null
   if (!vnode) {
+    // means unmount
     value = null
+  } else if (isAsyncWrapper(vnode)) {
+    // when mounting async components, nothing needs to be done,
+    // because the template ref is forwarded to inner component
+    return
+  } else if (vnode.shapeFlag & ShapeFlags.STATEFUL_COMPONENT) {
+    value = vnode.component!.exposed || vnode.component!.proxy
   } else {
-    if (vnode.shapeFlag & ShapeFlags.STATEFUL_COMPONENT) {
-      value = vnode.component!.proxy
-    } else {
-      value = vnode.el
-    }
+    value = vnode.el
   }
 
   const { i: owner, r: ref } = rawRef
@@ -364,10 +377,7 @@ export const setRef = (
       doSet()
     }
   } else if (isFunction(ref)) {
-    callWithErrorHandling(ref, parentComponent, ErrorCodes.FUNCTION_REF, [
-      value,
-      refs
-    ])
+    callWithErrorHandling(ref, owner, ErrorCodes.FUNCTION_REF, [value, refs])
   } else if (__DEV__) {
     warn('Invalid template ref type:', value, `(${typeof value})`)
   }
@@ -424,6 +434,12 @@ function baseCreateRenderer(
   // compile-time feature flags check
   if (__ESM_BUNDLER__ && !__TEST__) {
     initFeatureFlags()
+  }
+
+  if (__DEV__ || __FEATURE_PROD_DEVTOOLS__) {
+    const target = getGlobalThis()
+    target.__VUE__ = true
+    setDevtoolsHook(target.__VUE_DEVTOOLS_GLOBAL_HOOK__)
   }
 
   const {
@@ -548,7 +564,7 @@ function baseCreateRenderer(
 
     // set ref
     if (ref != null && parentComponent) {
-      setRef(ref, n1 && n1.ref, parentComponent, parentSuspense, n2)
+      setRef(ref, n1 && n1.ref, parentSuspense, n2)
     }
   }
 
@@ -628,35 +644,28 @@ function baseCreateRenderer(
     }
   }
 
-  /**
-   * Dev / HMR only
-   */
   const moveStaticNode = (
-    vnode: VNode,
+    { el, anchor }: VNode,
     container: RendererElement,
-    anchor: RendererNode | null
+    nextSibling: RendererNode | null
   ) => {
-    let cur = vnode.el
-    const end = vnode.anchor!
-    while (cur && cur !== end) {
-      const next = hostNextSibling(cur)
-      hostInsert(cur, container, anchor)
-      cur = next
+    let next
+    while (el && el !== anchor) {
+      next = hostNextSibling(el)
+      hostInsert(el, container, nextSibling)
+      el = next
     }
-    hostInsert(end, container, anchor)
+    hostInsert(anchor!, container, nextSibling)
   }
 
-  /**
-   * Dev / HMR only
-   */
-  const removeStaticNode = (vnode: VNode) => {
-    let cur = vnode.el
-    while (cur && cur !== vnode.anchor) {
-      const next = hostNextSibling(cur)
-      hostRemove(cur)
-      cur = next
+  const removeStaticNode = ({ el, anchor }: VNode) => {
+    let next
+    while (el && el !== anchor) {
+      next = hostNextSibling(el)
+      hostRemove(el)
+      el = next
     }
-    hostRemove(vnode.anchor!)
+    hostRemove(anchor!)
   }
 
   const processElement = (
@@ -1061,6 +1070,7 @@ function baseCreateRenderer(
   ) => {
     if (oldProps !== newProps) {
       for (const key in newProps) {
+        // empty string is not valid prop
         if (isReservedProp(key)) continue
         const next = newProps[key]
         const prev = oldProps[key]
@@ -1145,12 +1155,15 @@ function baseCreateRenderer(
       if (
         patchFlag > 0 &&
         patchFlag & PatchFlags.STABLE_FRAGMENT &&
-        dynamicChildren
+        dynamicChildren &&
+        // #2715 the previous fragment could've been a BAILed one as a result
+        // of renderSlot() with no valid children
+        n1.dynamicChildren
       ) {
         // a stable fragment (template root or <template v-for>) doesn't need to
         // patch children order, but it may contain dynamicChildren.
         patchBlockChildren(
-          n1.dynamicChildren!,
+          n1.dynamicChildren,
           dynamicChildren,
           container,
           parentComponent,
@@ -1398,8 +1411,9 @@ function baseCreateRenderer(
         }
         // onVnodeMounted
         if ((vnodeHook = props && props.onVnodeMounted)) {
+          const scopedInitialVNode = initialVNode
           queuePostRenderEffect(() => {
-            invokeVNodeHook(vnodeHook!, parent, initialVNode)
+            invokeVNodeHook(vnodeHook!, parent, scopedInitialVNode)
           }, parentSuspense)
         }
         // activated hook for keep-alive roots.
@@ -1413,6 +1427,13 @@ function baseCreateRenderer(
           queuePostRenderEffect(a, parentSuspense)
         }
         instance.isMounted = true
+
+        if (__DEV__ || __FEATURE_PROD_DEVTOOLS__) {
+          devtoolsComponentAdded(instance)
+        }
+
+        // #2458: deference mount-only object parameters to prevent memleaks
+        initialVNode = container = anchor = null as any
       } else {
         // updateComponent
         // This is triggered by mutation of component's own state (next: null)
@@ -1425,11 +1446,11 @@ function baseCreateRenderer(
         }
 
         if (next) {
+          next.el = vnode.el
           updateComponentPreRender(instance, next, optimized)
         } else {
           next = vnode
         }
-        next.el = vnode.el
 
         // beforeUpdate hook
         if (bu) {
@@ -1451,11 +1472,6 @@ function baseCreateRenderer(
         const prevTree = instance.subTree
         instance.subTree = nextTree
 
-        // reset refs
-        // only needed if previous patch had refs
-        if (instance.refs !== EMPTY_OBJ) {
-          instance.refs = {}
-        }
         if (__DEV__) {
           startMeasure(instance, `patch`)
         }
@@ -1937,8 +1953,7 @@ function baseCreateRenderer(
       return
     }
 
-    // static node move can only happen when force updating HMR
-    if (__DEV__ && type === Static) {
+    if (type === Static) {
       moveStaticNode(vnode, container, anchor)
       return
     }
@@ -1991,8 +2006,8 @@ function baseCreateRenderer(
       dirs
     } = vnode
     // unset ref
-    if (ref != null && parentComponent) {
-      setRef(ref, null, parentComponent, parentSuspense, null)
+    if (ref != null) {
+      setRef(ref, null, parentSuspense, null)
     }
 
     if (shapeFlag & ShapeFlags.COMPONENT_SHOULD_KEEP_ALIVE) {
@@ -2033,12 +2048,20 @@ function baseCreateRenderer(
           false,
           true
         )
-      } else if (!optimized && shapeFlag & ShapeFlags.ARRAY_CHILDREN) {
+      } else if (
+        (type === Fragment &&
+          (patchFlag & PatchFlags.KEYED_FRAGMENT ||
+            patchFlag & PatchFlags.UNKEYED_FRAGMENT)) ||
+        (!optimized && shapeFlag & ShapeFlags.ARRAY_CHILDREN)
+      ) {
         unmountChildren(children as VNode[], parentComponent, parentSuspense)
       }
 
-      // an unmounted teleport should always remove its children
-      if (shapeFlag & ShapeFlags.TELEPORT) {
+      // an unmounted teleport should always remove its children if not disabled
+      if (
+        shapeFlag & ShapeFlags.TELEPORT &&
+        (doRemove || !isTeleportDisabled(vnode.props))
+      ) {
         ;(vnode.type as typeof TeleportImpl).remove(vnode, internals)
       }
 
@@ -2063,7 +2086,7 @@ function baseCreateRenderer(
       return
     }
 
-    if (__DEV__ && type === Static) {
+    if (type === Static) {
       removeStaticNode(vnode)
       return
     }
@@ -2183,46 +2206,13 @@ function baseCreateRenderer(
     return hostNextSibling((vnode.anchor || vnode.el)!)
   }
 
-  /**
-   * #1156
-   * When a component is HMR-enabled, we need to make sure that all static nodes
-   * inside a block also inherit the DOM element from the previous tree so that
-   * HMR updates (which are full updates) can retrieve the element for patching.
-   *
-   * #2080
-   * Inside keyed `template` fragment static children, if a fragment is moved,
-   * the children will always moved so that need inherit el form previous nodes
-   * to ensure correct moved position.
-   */
-  const traverseStaticChildren = (n1: VNode, n2: VNode, shallow = false) => {
-    const ch1 = n1.children
-    const ch2 = n2.children
-    if (isArray(ch1) && isArray(ch2)) {
-      for (let i = 0; i < ch1.length; i++) {
-        // this is only called in the optimized path so array children are
-        // guaranteed to be vnodes
-        const c1 = ch1[i] as VNode
-        const c2 = (ch2[i] = cloneIfMounted(ch2[i] as VNode))
-        if (c2.shapeFlag & ShapeFlags.ELEMENT && !c2.dynamicChildren) {
-          if (c2.patchFlag <= 0 || c2.patchFlag === PatchFlags.HYDRATE_EVENTS) {
-            c2.el = c1.el
-          }
-          if (!shallow) traverseStaticChildren(c1, c2)
-        }
-        if (__DEV__ && c2.type === Comment) {
-          c2.el = c1.el
-        }
-      }
-    }
-  }
-
-  const render: RootRenderFunction = (vnode, container) => {
+  const render: RootRenderFunction = (vnode, container, isSVG) => {
     if (vnode == null) {
       if (container._vnode) {
         unmount(container._vnode, null, null, true)
       }
     } else {
-      patch(container._vnode || null, vnode, container)
+      patch(container._vnode || null, vnode, container, null, null, null, isSVG)
     }
     flushPostFlushCbs()
     container._vnode = vnode
@@ -2267,6 +2257,42 @@ export function invokeVNodeHook(
     vnode,
     prevVNode
   ])
+}
+
+/**
+ * #1156
+ * When a component is HMR-enabled, we need to make sure that all static nodes
+ * inside a block also inherit the DOM element from the previous tree so that
+ * HMR updates (which are full updates) can retrieve the element for patching.
+ *
+ * #2080
+ * Inside keyed `template` fragment static children, if a fragment is moved,
+ * the children will always moved so that need inherit el form previous nodes
+ * to ensure correct moved position.
+ */
+export function traverseStaticChildren(n1: VNode, n2: VNode, shallow = false) {
+  const ch1 = n1.children
+  const ch2 = n2.children
+  if (isArray(ch1) && isArray(ch2)) {
+    for (let i = 0; i < ch1.length; i++) {
+      // this is only called in the optimized path so array children are
+      // guaranteed to be vnodes
+      const c1 = ch1[i] as VNode
+      let c2 = ch2[i] as VNode
+      if (c2.shapeFlag & ShapeFlags.ELEMENT && !c2.dynamicChildren) {
+        if (c2.patchFlag <= 0 || c2.patchFlag === PatchFlags.HYDRATE_EVENTS) {
+          c2 = ch2[i] = cloneIfMounted(ch2[i] as VNode)
+          c2.el = c1.el
+        }
+        if (!shallow) traverseStaticChildren(c1, c2)
+      }
+      // also inherit for comment nodes, but not placeholders (e.g. v-if which
+      // would have received .el during block patch)
+      if (__DEV__ && c2.type === Comment && !c2.el) {
+        c2.el = c1.el
+      }
+    }
+  }
 }
 
 // https://en.wikipedia.org/wiki/Longest_increasing_subsequence

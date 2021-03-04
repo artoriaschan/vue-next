@@ -245,11 +245,14 @@ interface AriaAttributes {
   'aria-valuetext'?: string
 }
 
+// Vue's style normalization supports nested arrays
+type StyleValue = string | CSSProperties | Array<StyleValue>
+
 export interface HTMLAttributes extends AriaAttributes, EventHandlers<Events> {
   innerHTML?: string
 
   class?: any
-  style?: string | CSSProperties
+  style?: StyleValue
 
   // Standard HTML Attributes
   accesskey?: string
@@ -1004,6 +1007,7 @@ export interface SVGAttributes extends AriaAttributes, EventHandlers<Events> {
   xlinkShow?: string
   xlinkTitle?: string
   xlinkType?: string
+  xmlns?: string
   y1?: number | string
   y2?: number | string
   y?: number | string
@@ -1213,6 +1217,8 @@ export interface Events {
 
   // focus events
   onFocus: FocusEvent
+  onFocusin: FocusEvent
+  onFocusout: FocusEvent
   onBlur: FocusEvent
 
   // form events
